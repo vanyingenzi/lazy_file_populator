@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
@@ -13,6 +14,9 @@ import (
 )
 
 const fileName = "lazy.data"
+const metaNode = "node-meta"
+
+var nodes = [2]string{"node1", "node2"}
 
 type FS struct{}
 
@@ -31,21 +35,29 @@ func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 func (Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	log.Println("Looking up the dir")
 	if name == fileName {
-		return File{}, nil
+		return &File{
+			Name:    fileName,
+			Size:    1024 * 1024,
+			Mode:    0444,
+			ModTime: time.Now(),
+		}, nil
 	}
 	return nil, syscall.Errno(syscall.ENOENT)
 }
 
 func (Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	log.Println("Reading the dir")
-	// TODO(vi): Cache file in another folder if already request by os.WriteFile(..)
-	// TODO(vi): Read the real_files when content is local os.ReadFile(..)
 	return []fuse.Dirent{
 		{Inode: 2, Name: fileName, Type: fuse.DT_File},
 	}, nil
 }
 
-type File struct{}
+type File struct {
+	Name    string
+	Size    int64
+	Mode    os.FileMode
+	ModTime time.Time
+}
 
 func (File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 2
@@ -55,13 +67,114 @@ func (File) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func (File) ReadAll(ctx context.Context) ([]byte, error) {
-	log.Println("Lazy fetch triggered: generating dummy data")
+func dummyData() []byte {
 	data := make([]byte, 1024*1024)
-	for i := range data {
-		data[i] = 'A'
+	for i := 0; i < len(data)-10; i += 10 {
+		data[i] = 'Q'
+		data[i+1] = 'U'
+		data[i+2] = 'O'
+		data[i+3] = 'I'
+		data[i+4] = 'C'
+		data[i+5] = 'O'
+		data[i+6] = 'U'
+		data[i+7] = 'B'
+		data[i+8] = 'E'
+		data[i+9] = 'H'
 	}
-	return data, nil
+
+	return data
+}
+
+func (f *File) WriteMeta(ctx context.Context) error {
+	log.Println("Writing metadata to file")
+	meta, err := json.Marshal(File{
+		Name:    f.Name,
+		Size:    f.Size,
+		Mode:    f.Mode,
+		ModTime: f.ModTime,
+	})
+
+	if err != nil {
+		log.Printf("Failed to marshal metadata: %v", err)
+		return err
+	}
+
+	if err := os.WriteFile(metaNode+"/"+fileName+"-meta.json", meta, 0444); err != nil {
+		log.Printf("Failed to write metadata to file: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func (local *File) compareMeta(distantPath string) (bool, error) {
+	jsonFile, err := os.Open(distantPath)
+	if err != nil {
+		return false, err
+	}
+
+	jsonData := json.NewDecoder(jsonFile)
+	var meta File
+	if err := jsonData.Decode(&meta); err != nil {
+		log.Printf("Failed to decode metadata: %v", err)
+		return false, err
+	}
+
+	switch {
+	case meta.Name != local.Name:
+		log.Printf("Metadata mismatch: expected name %s, got %s", local.Name, meta.Name)
+		return false, nil
+	case meta.Size != local.Size:
+		log.Printf("Metadata mismatch: expected size %d, got %d", local.Size, meta.Size)
+		return false, nil
+	case meta.Mode != local.Mode:
+		log.Printf("Metadata mismatch: expected mode %o, got %o", local.Mode, meta.Mode)
+		return false, nil
+	case meta.ModTime != local.ModTime:
+		log.Printf("Metadata mismatch: expected modtime %v, got %v", local.ModTime, meta.ModTime)
+		return false, nil
+	default:
+		log.Println("Metadata matches")
+		return true, nil
+	}
+
+}
+
+func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
+	// TODO(vi): Cache file in another folder if already request by os.WriteFile(..)
+	// TODO(vi): Read the real_files when content is local os.ReadFile(..)
+	log.Println("Lazy fetch triggered: generating dummy data")
+	files, err := os.ReadDir("./mnt")
+	if err != nil {
+		log.Printf("Failed to read local directory: %v", err)
+	}
+
+	dummyData := dummyData()
+
+	for _, file := range files {
+		// TODO : remove this log later
+		log.Printf("File name : %s\n", file.Name())
+		for _, node := range nodes {
+			realFilePath := node + "/" + file.Name()
+			if _, err := os.Stat(realFilePath); err == nil {
+				// TODO : compare metadata
+				log.Printf("File %s already exists, skipping generation", file.Name())
+				continue
+			} else if os.IsNotExist(err) {
+				if err := os.WriteFile(realFilePath, dummyData, f.Mode); err != nil {
+					log.Printf("Failed to write dummy data to %s: %v", realFilePath, err)
+					return nil, err
+				}
+
+				if err := f.WriteMeta(ctx); err != nil {
+					log.Printf("Failed to write metadata for %s: %v", file.Name(), err)
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return dummyData, nil
 }
 
 func main() {
