@@ -107,7 +107,14 @@ func (f *File) WriteMeta(ctx context.Context) error {
 	return nil
 }
 
-func (local *File) compareMeta(distantPath string) (bool, error) {
+func compareMeta(localInfo os.FileInfo, distantPath string) (bool, error) {
+	local := &File{
+		Name:    localInfo.Name(),
+		Size:    localInfo.Size(),
+		Mode:    localInfo.Mode(),
+		ModTime: localInfo.ModTime().Local(),
+	}
+
 	jsonFile, err := os.Open(distantPath)
 	if err != nil {
 		return false, err
@@ -130,7 +137,7 @@ func (local *File) compareMeta(distantPath string) (bool, error) {
 	case meta.Mode != local.Mode:
 		log.Printf("Metadata mismatch: expected mode %o, got %o", local.Mode, meta.Mode)
 		return false, nil
-	case meta.ModTime != local.ModTime:
+	case (meta.ModTime.Unix()-local.ModTime.Unix()) > 1 || (local.ModTime.Unix()-meta.ModTime.Unix()) > 1: // abs value
 		log.Printf("Metadata mismatch: expected modtime %v, got %v", local.ModTime, meta.ModTime)
 		return false, nil
 	default:
@@ -156,12 +163,14 @@ func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
 		log.Printf("File name : %s\n", file.Name())
 		for _, node := range nodes {
 			realFilePath := node + "/" + file.Name()
-			if _, err := os.Stat(realFilePath); err == nil {
-				// TODO : compare metadata
-				log.Printf("File %s already exists, skipping generation", file.Name())
+			localInfo, err := os.Stat(realFilePath)
+			if err != nil {
+				log.Printf("Failed to read info of %s", file.Name())
 				continue
-			} else if os.IsNotExist(err) {
-				if err := os.WriteFile(realFilePath, dummyData, f.Mode); err != nil {
+			}
+			ok, err := compareMeta(localInfo, metaNode+"/"+file.Name()+"-meta.json")
+			if os.IsNotExist(err) || !ok {
+				if err := os.WriteFile(realFilePath, dummyData, localInfo.Mode()); err != nil {
 					log.Printf("Failed to write dummy data to %s: %v", realFilePath, err)
 					return nil, err
 				}
@@ -170,6 +179,8 @@ func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
 					log.Printf("Failed to write metadata for %s: %v", file.Name(), err)
 					return nil, err
 				}
+			} else {
+				log.Printf("File %s already exists and metadata matches, skipping generation", file.Name())
 			}
 		}
 	}
