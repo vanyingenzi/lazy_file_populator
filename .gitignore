@@ -34,3 +34,4 @@ go.work.sum
 
 # Mount dir for demo
 mnt/
+node*/
